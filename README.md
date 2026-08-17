@@ -140,8 +140,6 @@ Output: console metrics (precision/recall/false-positive/false-negative/
 accuracy, plus average per-comparison timing) and `results.csv` with one row
 per session pair (`decision`, `confidence`, `reason`, correctness flag).
 
-Runtime is dominated by the LLM calls on `BORDERLINE` pairs only — most
-pairs are resolved by the cosine threshold alone and never touch the model.
 
 ## Notes
 
