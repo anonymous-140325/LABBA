@@ -1,0 +1,12 @@
+{
+    "num_blows": 4,
+    "start_delay": 1.023125,
+    "blow_gaps": [
+        1.06075,
+        0.12172916666666644,
+        0.7212083333333337
+    ],
+    "session_duration": 5.18,
+    "total_blow_duration": 1.9263333333333332,
+    "duty_cycle": 0.3718790211611087
+}

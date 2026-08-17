@@ -39,10 +39,13 @@ appropriate build flags for your platform (see the
 The script expects a GGUF-quantized Phi-3-mini model at:
 
 ```
-~/assets/Phi-3-mini-4k-instruct-q4.gguf
+assets/Phi-3-mini-4k-instruct-q4.gguf
 ```
 
-Download it (e.g. `Phi-3-mini-4k-instruct-q4.gguf` from the
+(relative to `llmEvaluation.py` itself, alongside the `assets/LABBA_Data`
+dataset described below — not under the OS home directory, so the path is
+the same on every machine that checks out this repo). Download it (e.g.
+`Phi-3-mini-4k-instruct-q4.gguf` from the
 [microsoft/Phi-3-mini-4k-instruct-gguf](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf)
 repo on Hugging Face) and place it at that path, or edit `model_path` in
 `llmEvaluation.py`'s `__main__` block to point elsewhere. Any other instruct
@@ -53,13 +56,12 @@ models.
 ## Data format
 
 This repo does **not** include any biometric recordings or derived data —
-only the code. To reproduce results you need your own dataset laid out as
-follows.
+only the code. To reproduce results you need a dataset laid out like
+`assets/LABBA_Data/` (relative to `llmEvaluation.py`): one subfolder per
+recording session, each holding a matched triple of files that share a
+common `<User>_<Posture>_Session<N>` id, e.g. for `User10_Sit_Session1`:
 
-**Structured features** — under `~/assets/BlowPrintData/`, one subfolder per
-session containing a matched pair of JSON files:
-
-- `<base_name>_blow_features_fast.json` — a list of per-blow objects:
+- `User10_Sit_blow_features_Session1.json` — a list of per-blow objects:
   ```json
   {
     "blow_id": 1,
@@ -76,7 +78,7 @@ session containing a matched pair of JSON files:
     "decay_slope": -0.156
   }
   ```
-- `<base_name>_session_features_fast.json` — one object per session:
+- `User10_Sit_session_features_Session1.json` — one object per session:
   ```json
   {
     "num_blows": 2,
@@ -87,24 +89,37 @@ session containing a matched pair of JSON files:
     "duty_cycle": 0.739
   }
   ```
+- `User10_Sit_emb_Session1.csv` — the session's embedding vector, one float
+  per line (e.g. 128-d):
+  ```
+  -0.2185
+  0.0981
+  ...
+  ```
 
-**Embeddings** — under `~/assets/BlowPrintData_clean/`, one CSV per session
-whose filename contains `new_audio` (and not `binary`), with one float per
-line (a flat embedding vector, e.g. 128-d):
-```
--0.2185
-0.0981
-...
-```
+`read_all_features()`/`read_all_embeddings()` walk this directory
+recursively (`os.walk`), pair files up by stripping each file's
+`_blow_features` / `_session_features` / `_emb` marker to recover the
+shared session id, and sort both resulting lists by that id using a
+natural (numeric-aware) sort — a plain lexicographic sort would put
+`User10_...` right after `User1_...`, ahead of `User2_...`. `__main__`
+then checks `all_features` and `all_embeddings` are the same length and
+aligned id-for-id before running anything else, since `session_names`
+(built from `num_users`/`sessions_per_user`) labels sessions purely by
+position: 500 sessions across 50 users, 10 sessions each (5 `Sit` + 5
+`Stand`), matching `num_users = 50` / `sessions_per_user = 10` in
+`__main__`.
 
-Both directories are walked recursively (`os.walk`), and each directory's
-files are sorted alphabetically by filename to build `all_features` and
-`all_embeddings` respectively — **the two lists must end up in the same
-session order** for `session_names` (built from `num_users` /
-`sessions_per_user` in `__main__`) to label the right session correctly.
-If your embedding and feature filenames don't sort into matching order,
-fix the sort key or the filenames before trusting the metrics — this
-alignment is not otherwise checked at runtime.
+## Raw audio (not included)
+
+`assets/LABBA_Data/` contains only the derived, non-reversible artifacts
+(per-blow/session features and embedding vectors) that `llmEvaluation.py`
+consumes — no raw audio. `softBiometricExtraction.py` is the earlier stage
+that produces those artifacts from raw "blow" audio recordings (see
+`process_all_data()`/`analyze_blow_pattern()`), but the raw recordings
+themselves are **not provided in this repo**, since they're biometric data
+tied to real participants. Reproducing `LABBA_Data` from scratch would
+require your own raw-audio dataset run through `softBiometricExtraction.py`.
 
 ## Running
 

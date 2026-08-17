@@ -15,6 +15,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 BORDERLINE_MARGIN = 0.3
 
 
+# Dataset lives in an `assets/` folder alongside this script (not under the
+# OS home directory) so the path is the same on every machine that checks
+# out this repo, regardless of whose home directory it runs from.
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+LABBA_DATA_DIR = ASSETS_DIR / "LABBA_Data"
+
 FEATURE_FILE_SUFFIX = ""
 
 first_tp = True
@@ -99,23 +105,49 @@ def cosine_similarity_to_distance(similarity_matrix):
     return 1 - similarity_matrix
 
 
+# Every session in LABBA_Data lives under its own folder as a matched
+# triple of files sharing one canonical id, e.g. for "User10_Sit_Session1":
+#   User10_Sit_blow_features_Session1.json
+#   User10_Sit_session_features_Session1.json
+#   User10_Sit_emb_Session1.csv
+# The marker below is the only thing distinguishing each file's name from
+# that shared id, so stripping it recovers the id - which is how blow/
+# session feature files get paired up, and how all_features/all_embeddings
+# are checked for alignment in __main__.
+BLOW_FEATURES_MARKER = "_blow_features"
+SESSION_FEATURES_MARKER = "_session_features"
+EMBEDDING_MARKER = "_emb"
+
+
+def _canonical_session_id(stem):
+    for marker in (
+        f"{BLOW_FEATURES_MARKER}{FEATURE_FILE_SUFFIX}",
+        f"{SESSION_FEATURES_MARKER}{FEATURE_FILE_SUFFIX}",
+        EMBEDDING_MARKER,
+    ):
+        if marker in stem:
+            return stem.replace(marker, "", 1)
+    return stem
+
+
 def read_all_embeddings():
     """
-    Read all embedding files from blowprint_data_clean directory
-    Look for files with 'combine' keyword in filename
+    Read all *_emb_*.csv embedding files from the LABBA_Data directory.
     """
-    base_dir = "~/assets/BlowPrintData_clean" #set the path to your blowprint_data_clean directory
-    base_dir = os.path.expanduser(base_dir)
+    base_dir = LABBA_DATA_DIR
 
     embedding_files = []
 
     for dirpath, _, filenames in os.walk(base_dir):
         for filename in filenames:
-            if "new_audio" in filename.lower() and "binary" not in filename.lower():
+            if EMBEDDING_MARKER in filename and filename.lower().endswith(".csv"):
                 file_path = os.path.join(dirpath, filename)
                 embedding_files.append(file_path)
 
-    embedding_files.sort(key=lambda x: os.path.basename(x).lower())
+    # Natural (numeric-aware) sort so user2 sorts before user10 - a plain
+    # lexicographic sort would put "user10_..." right after "user1_...",
+    # which would misalign every session against session_names below.
+    embedding_files.sort(key=lambda x: natural_key(os.path.basename(x).lower()))
 
     print(f"Found {len(embedding_files)} embedding files")
     return embedding_files
@@ -135,10 +167,10 @@ def load_all_embeddings_unformatted():
             embedding = np.loadtxt(file_path, delimiter=',')
 
             filename = os.path.basename(file_path)
-            base_name = os.path.splitext(filename)[0]
+            stem = os.path.splitext(filename)[0]
 
             all_embeddings.append({
-                'filename': base_name,
+                'filename': _canonical_session_id(stem),
                 'full_path': file_path,
                 'embedding': embedding,
                 'shape': embedding.shape,
@@ -155,32 +187,35 @@ def load_all_embeddings_unformatted():
 
 def read_all_features():
     """
-    Read all blow and session feature JSON files from the data directory
+    Read all blow and session feature JSON files from the LABBA_Data
+    directory, pairing each *_blow_features_*.json with its matching
+    *_session_features_*.json by canonical session id.
     """
-    base_dir = "~/assets/BlowPrintData"
-    base_dir = os.path.expanduser(base_dir)
+    base_dir = LABBA_DATA_DIR
 
     feature_files = []
 
-    blow_suffix = f"_blow_features{FEATURE_FILE_SUFFIX}.json"
-    session_suffix = f"_session_features{FEATURE_FILE_SUFFIX}.json"
+    blow_marker = f"{BLOW_FEATURES_MARKER}{FEATURE_FILE_SUFFIX}"
+    session_marker = f"{SESSION_FEATURES_MARKER}{FEATURE_FILE_SUFFIX}"
 
     for dirpath, _, filenames in os.walk(base_dir):
         for filename in filenames:
-            if filename.endswith(blow_suffix):
+            if blow_marker in filename and filename.endswith(".json"):
                 blow_file = os.path.join(dirpath, filename)
 
-                base_name = filename[:-len(blow_suffix)]
-                session_file = os.path.join(dirpath, f"{base_name}{session_suffix}")
+                base_name = filename.replace(blow_marker, "", 1)
+                session_filename = filename.replace(blow_marker, session_marker, 1)
+                session_file = os.path.join(dirpath, session_filename)
 
                 if os.path.exists(session_file):
                     feature_files.append({
-                        'base_name': base_name,
+                        'base_name': os.path.splitext(base_name)[0],
                         'blow_file': blow_file,
                         'session_file': session_file
                     })
 
-    feature_files.sort(key=lambda x: x['base_name'].lower())
+    # Same natural-sort reasoning as read_all_embeddings() above.
+    feature_files.sort(key=lambda x: natural_key(x['base_name'].lower()))
 
     print(f"Found {len(feature_files)} feature file pairs")
     return feature_files
@@ -679,9 +714,29 @@ if __name__ == "__main__":
     all_features = load_all_features_unformatted()
     all_embeddings = load_all_embeddings_unformatted()
 
+    # all_features[i] and all_embeddings[i] must be the same physical
+    # session - cosine_matrix[i] is compared against fused_cache[i] purely
+    # by index below, with no name lookup at comparison time. Both lists
+    # are sorted the same way (natural sort on the canonical session id),
+    # so this should always hold for a complete LABBA_Data tree; catch it
+    # here rather than silently computing metrics against misaligned data.
+    if len(all_features) != len(all_embeddings):
+        raise SystemExit(
+            f"Feature/embedding count mismatch: {len(all_features)} feature "
+            f"pairs vs {len(all_embeddings)} embeddings - check LABBA_Data "
+            "for sessions missing a features pair or an embedding file."
+        )
+    for idx, (feat, emb) in enumerate(zip(all_features, all_embeddings)):
+        if feat['filename'] != emb['filename']:
+            raise SystemExit(
+                f"all_features/all_embeddings are misaligned at index {idx} "
+                f"({feat['filename']!r} vs {emb['filename']!r}) - fix the "
+                "sort/filenames in LABBA_Data before trusting any metrics."
+            )
+
     # Parameters
     num_users = 50
-    sessions_per_user = 10
+    sessions_per_user = 10  # 2 postures (Sit/Stand) x 5 sessions in LABBA_Data
 
     session_names = []
     for u in range(1, num_users + 1):
@@ -831,7 +886,7 @@ if __name__ == "__main__":
 
                     if llm is None:
                         llm = Llama(
-                            model_path=os.path.expanduser("~/assets/Phi-3-mini-4k-instruct-q4.gguf"),
+                            model_path=str(ASSETS_DIR / "Phi-3-mini-4k-instruct-q4.gguf"),
                             n_ctx=2048,
                             verbose=False
                         )
