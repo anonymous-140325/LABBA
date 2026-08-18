@@ -17,7 +17,23 @@ is only consulted for borderline decisions.
 3. **Per-user adaptive threshold** — for each enrolled user, a
    cosine-similarity threshold is derived from that user's own session-to-session
    variability (`determine_threshold`, `get_all_user_thresholds`).
-4. **Evaluation** — the script sweeps every session pair, tallies
+4. **Score enroll vs. attempt** — for each pair, one of two interchangeable
+   scoring methods converts the enroll/attempt features into what the LLM
+   sees, selected via the `SCORING_METHOD` constant near `create_auth_prompt()`:
+   - `"score_based"` (default) — continuous 0-100 similarity scores,
+     each normalized against that user's own per-session baseline
+     (z-score for scalars, DTW-distance-vs-baseline for sequences).
+   - `"rule_based"` — discrete `VERY_GOOD`/`GOOD`/`OKAY`/`WEAK`/`BAD`
+     labels from fixed, global percentage-difference cutoffs — no
+     per-user baseline involved.
+
+   Both read the same `fused_features()` output and produce the same
+   `Decision`/`Confidence`/`Reason` prompt contract, so switching between
+   them only requires changing `SCORING_METHOD` — nothing else in the
+   pipeline changes. `SCORING_METHOD` is folded into the checkpoint's run
+   signature, so a checkpoint from one scoring method is never silently
+   resumed under the other.
+5. **Evaluation** — the script sweeps every session pair, tallies
    TP/FP/TN/FN, prints precision/recall/FPR/FNR/accuracy, and writes a
    per-pair breakdown to `results.csv`.
 
@@ -127,12 +143,13 @@ require your own raw-audio dataset run through `softBiometricExtraction.py`.
 python llmEvaluation.py
 ```
 
-Key knobs at the top of `__main__`:
+Key knobs:
 
 | Variable | Meaning |
 |---|---|
-| `num_users`, `sessions_per_user` | Used to synthesize `session_names` (`user1`, `user1`, ..., `user2`, ...) — must match your dataset's layout and sort order. |
-| `k`, `q` | Neighbor/percentile parameters for the per-user threshold (`determine_threshold`). |
+| `SCORING_METHOD` (module-level, just above `create_auth_prompt()`) | `"score_based"` (default) or `"rule_based"` — see [How it works](#how-it-works) above. |
+| `num_users`, `sessions_per_user` (in `__main__`) | Used to synthesize `session_names` (`user1`, `user1`, ..., `user2`, ...) — must match your dataset's layout and sort order. |
+| `k`, `q` (in `__main__`) | Neighbor/percentile parameters for the per-user threshold (`determine_threshold`). |
 | `range(0, 500)` (x2) in the comparison loop | Number of sessions compared; set to `len(all_embeddings)` for your dataset. |
 | `n_ctx`, `max_tokens`, `temperature` | Llama.cpp generation settings. |
 

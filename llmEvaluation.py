@@ -258,29 +258,37 @@ def r(x, d=3):
 
 def fused_features(blow_features, session_features):
     """
-    Per-session biometric representation feeding the 6 blow-pattern scored
-    dimensions:
-    - rhythm sequence (gaps) -> gap DTW
-    - duration sequence -> duration DTW
-    - shape sequence (rise/fall ratio) -> shape DTW
-    - amplitude (rms) -> amplitude score
-    - duty cycle -> "mass" score
-    - blow count -> blow_count score
-    (the 7th score, cosine position, comes from the embedding matrix
-    directly and isn't part of this per-session structure — see
-    cosine_position_score() below)
+    Per-session biometric representation feeding both scoring methods below
+    (SCORING_METHOD == "score_based" or "rule_based" — see that constant
+    near __main__):
+    - rhythm sequence (gaps) -> gap DTW / gap sequence_similarity
+    - duration sequence -> duration DTW / duration sequence_similarity
+    - shape sequence (rise/fall ratio) -> shape DTW / shape_similarity
+    - amplitude (rms) -> amplitude score (score-based only)
+    - amplitude (mean) -> amplitude_similarity (rule-based only)
+    - duty cycle -> "mass" score / mass_similarity
+    - blow count -> blow_count score / blow_count_similarity
+    - attack/decay slope sequences -> rule-based only, not currently
+      compared by either scoring method's top-level score/label, kept here
+      for parity with the rule-based lineage this was folded in from
+    (the embedding/cosine score is computed separately from the embedding
+    matrix, not part of this per-session structure — see
+    cosine_position_score() / cosine_rule_based_label() below)
     """
 
     starts = np.array([b["start_time"] for b in blow_features])
     ends = np.array([b["end_time"] for b in blow_features])
 
     durations = [r(b["duration"]) for b in blow_features]
+    mean_amp_seq = [r(b["mean_amp"]) for b in blow_features]
     rms_amp_seq = [r(b["rms_amp"]) for b in blow_features]
 
     rise_fall_seq = [
         r(b["rise_time"] / (b["fall_time"] + 1e-6))
         for b in blow_features
     ]
+    attack_seq = [r(b["attack_slope"]) for b in blow_features]
+    decay_seq = [r(b["decay_slope"]) for b in blow_features]
 
     gaps = []
 
@@ -299,7 +307,10 @@ def fused_features(blow_features, session_features):
     duty_cycle = total_blow_duration / (session_duration + 1e-6)
 
     duration_mean = r(np.mean(durations))
+    duration_std = r(np.std(durations))
     amp_rms_mean = r(np.mean(rms_amp_seq))
+    amp_mean = r(np.mean(mean_amp_seq))
+    amp_std = r(np.std(mean_amp_seq))
 
     return {
         "num_blows": num_blows,
@@ -309,13 +320,20 @@ def fused_features(blow_features, session_features):
 
         "gap_pattern": gap_pattern,
 
+        "mean_amp_seq": mean_amp_seq,
+        "amp_mean": amp_mean,
+        "amp_std": amp_std,
+
         "rms_amp_seq": rms_amp_seq,
         "amp_rms_mean": amp_rms_mean,
 
         "duration_seq": durations,
         "duration_mean": duration_mean,
+        "duration_std": duration_std,
 
         "rise_fall_seq": rise_fall_seq,
+        "attack_seq": attack_seq,
+        "decay_seq": decay_seq,
     }
 
 
@@ -526,7 +544,7 @@ def cosine_position_score(cosine_sim, threshold):
     return int(round(frac * 100 / 5.0) * 5)
 
 
-def convert_features_to_semantic(enroll_feat, attempt_feat, baseline, cosine_sim, threshold):
+def convert_features_to_semantic_score_based(enroll_feat, attempt_feat, baseline, cosine_sim, threshold):
     """
     Reduce enroll vs. attempt into 7 0-100 similarity scores the LLM can
     reason about: how borderline the raw embedding match itself is, blow
@@ -584,9 +602,15 @@ total_feat = 0
 total_prompt = 0
 
 
-def create_auth_prompt(enroll_feat, attempt_feat, cosine_sim, threshold, baseline):
+def create_auth_prompt_score_based(enroll_feat, attempt_feat, cosine_sim, threshold, baseline):
+    """
+    Continuous scoring: every feature is a 0-100 similarity score, each
+    normalized against this user's own per-session baseline (z-score for
+    scalars, DTW-distance-vs-baseline for sequences) - see
+    convert_features_to_semantic_score_based() / compute_user_baselines().
+    """
     start_feat = time.time()
-    semantic = convert_features_to_semantic(enroll_feat, attempt_feat, baseline, cosine_sim, threshold)
+    semantic = convert_features_to_semantic_score_based(enroll_feat, attempt_feat, baseline, cosine_sim, threshold)
     end_feat = time.time()
     global total_feat
     total_feat += (end_feat - start_feat)
@@ -623,6 +647,248 @@ Reason: Describe Accept/Reject Decision
     global total_prompt
     total_prompt += (end_prompts - start_prompts)
     return prompt
+
+
+# =========================================================
+# Rule-based (discrete-label) scoring — alternative to the continuous
+# 0-100 scoring above. Instead of per-user z-scores/DTW-vs-baseline, each
+# feature is thresholded against a fixed, global percentage-difference cutoff
+# into one of five labels (VERY_GOOD/GOOD/OKAY/WEAK/BAD). No per-user
+# baseline is needed here - this scoring system doesn't have one. Ported
+# from newPrompt_6features.py (via newPrompt_6features_demo.py).
+# =========================================================
+
+def percentage_difference(a, b):
+    """
+    Symmetric percentage difference. Avoids division explosion for small
+    values by averaging the two magnitudes in the denominator instead of
+    dividing by either one alone.
+    """
+    a = float(a)
+    b = float(b)
+
+    denom = max((abs(a) + abs(b)) / 2.0, 1e-6)
+    return abs(a - b) / denom
+
+
+def diff_to_label(diff):
+    """Convert a normalized percentage difference into a semantic label."""
+    if diff <= 0.10:
+        return "VERY_GOOD"
+    elif diff <= 0.20:
+        return "GOOD"
+    elif diff <= 0.30:
+        return "OKAY"
+    elif diff <= 0.50:
+        return "WEAK"
+    else:
+        return "BAD"
+
+
+def cosine_rule_based_label(cosine_sim, threshold):
+    """
+    Rule-based label for the raw embedding similarity, on the same
+    VERY_GOOD..BAD vocabulary as the other 6 features (unlike those, which
+    threshold a computed percentage difference, this thresholds the
+    cosine-vs-threshold margin directly):
+      - VERY_GOOD: at or above the auto-accept threshold
+      - BAD: at or below the far edge of the borderline band
+        (threshold - BORDERLINE_MARGIN)
+      - GOOD / OKAY / WEAK: the borderline band itself split into 3 equal
+        sub-ranges, closest-to-threshold to closest-to-BAD, so an
+        ambiguous case isn't collapsed into a single undifferentiated
+        bucket
+    """
+    margin = cosine_sim - threshold
+    if margin >= 0:
+        return "VERY_GOOD"
+    if margin <= -BORDERLINE_MARGIN:
+        return "BAD"
+
+    # Strictly inside the borderline band: frac goes from just above 0
+    # (right at the threshold) to just below 1 (right at the BAD edge).
+    frac = -margin / BORDERLINE_MARGIN
+    if frac <= 1 / 3:
+        return "GOOD"
+    elif frac <= 2 / 3:
+        return "OKAY"
+    else:
+        return "WEAK"
+
+
+def sequence_similarity(seq1, seq2):
+    """Compare two numeric sequences element-wise via percentage_difference."""
+    n = min(len(seq1), len(seq2))
+
+    if n == 0:
+        return {"overall": "BAD", "details": []}
+
+    labels = []
+    for i in range(n):
+        diff = percentage_difference(seq1[i], seq2[i])
+        label = diff_to_label(diff)
+        labels.append({
+            "index": i,
+            "enroll": round(seq1[i], 3),
+            "attempt": round(seq2[i], 3),
+            "diff": round(diff * 100, 1),
+            "label": label
+        })
+
+    avg_diff = np.mean([percentage_difference(seq1[i], seq2[i]) for i in range(n)])
+    overall = diff_to_label(avg_diff)
+
+    return {"overall": overall, "details": labels}
+
+
+def shape_diff_to_label(diff):
+    # diff is a normalized percentage, 0.5 = 50% - shape (rise/fall ratio)
+    # naturally varies more than the other features, so this uses wider
+    # cutoffs than diff_to_label() rather than reusing it.
+    if diff <= 0.50:
+        return "VERY_GOOD"
+    elif diff <= 1.00:
+        return "GOOD"
+    elif diff <= 1.50:
+        return "OKAY"
+    elif diff <= 2.00:
+        return "WEAK"
+    else:
+        return "BAD"
+
+
+def shape_similarity(shape1, shape2):
+    n = min(len(shape1), len(shape2))
+
+    if n == 0:
+        return {"overall": "BAD", "details": []}
+
+    labels = []
+    diffs = []
+    for i in range(n):
+        s1 = float(shape1[i])
+        s2 = float(shape2[i])
+        denom = max((abs(s1) + abs(s2)) / 2.0, 1e-6)
+        diff = abs(s1 - s2) / denom
+        diffs.append(diff)
+        label = shape_diff_to_label(diff)
+        labels.append({
+            "index": i,
+            "enroll": round(s1, 3),
+            "attempt": round(s2, 3),
+            "diff_percent": round(diff * 100, 1),
+            "label": label
+        })
+
+    avg_diff = np.mean(diffs)
+    overall = shape_diff_to_label(avg_diff)
+
+    return {"overall": overall, "details": labels}
+
+
+def convert_features_to_semantic_rule_based(enroll_feat, attempt_feat, cosine_sim, threshold):
+    """
+    Reduce enroll vs. attempt into 7 discrete VERY_GOOD..BAD labels the LLM
+    can reason about - the rule-based counterpart of
+    convert_features_to_semantic_score_based() above, using fixed global
+    percentage-difference cutoffs instead of per-user z-scores/DTW.
+    """
+    embedding_label = cosine_rule_based_label(cosine_sim, threshold)
+
+    blow_diff = abs(enroll_feat['num_blows'] - attempt_feat['num_blows'])
+    if blow_diff == 0:
+        blow_label = "VERY_GOOD"
+    elif blow_diff == 1:
+        blow_label = "OKAY"
+    else:
+        blow_label = "BAD"
+
+    gap_result = sequence_similarity(enroll_feat['gap_pattern'], attempt_feat['gap_pattern'])
+    duration_result = sequence_similarity(enroll_feat['duration_seq'], attempt_feat['duration_seq'])
+    shape_result = shape_similarity(enroll_feat['rise_fall_seq'], attempt_feat['rise_fall_seq'])
+
+    amplitude_diff = percentage_difference(enroll_feat['amp_mean'], attempt_feat['amp_mean'])
+    amplitude_label = diff_to_label(amplitude_diff)
+
+    mass_diff = percentage_difference(enroll_feat['duty_cycle'], attempt_feat['duty_cycle'])
+    mass_label = diff_to_label(mass_diff)
+
+    return {
+        "embedding_similarity": embedding_label,
+        "blow_count_similarity": blow_label,
+        "gap_similarity": gap_result["overall"],
+        "duration_similarity": duration_result["overall"],
+        "shape_similarity": shape_result["overall"],
+        "amplitude_similarity": amplitude_label,
+        "mass_similarity": mass_label,
+        # per-blow breakdowns, kept for CSV/debug inspection; never shown to the LLM
+        "shape_details": shape_result["details"],
+        "gap_details": gap_result["details"],
+        "duration_details": duration_result["details"],
+    }
+
+
+def create_auth_prompt_rule_based(enroll_feat, attempt_feat, cosine_sim, threshold, baseline=None):
+    """
+    Discrete scoring: every feature is a VERY_GOOD/GOOD/OKAY/WEAK/BAD label
+    against a fixed global percentage-difference cutoff - no per-user
+    baseline needed, so `baseline` is accepted (for a uniform call site
+    alongside create_auth_prompt_score_based) but ignored.
+    """
+    start_feat = time.time()
+    semantic = convert_features_to_semantic_rule_based(enroll_feat, attempt_feat, cosine_sim, threshold)
+    end_feat = time.time()
+    global total_feat
+    total_feat += (end_feat - start_feat)
+
+    start_prompts = time.time()
+    prompt = f"""
+You are a biometric verification assistant for blow audio patterns.
+
+TASK:
+Decide ACCEPT or REJECT for a blow pattern authentication attempt.
+
+ENROLL vs ATTEMPT ANALYSIS:
+
+- embedding similarity: {semantic['embedding_similarity']}
+- blow count similarity: {semantic['blow_count_similarity']}
+- gap similarity: {semantic['gap_similarity']}
+- duration similarity: {semantic['duration_similarity']}
+- shape similarity: {semantic['shape_similarity']}
+- amplitude similarity: {semantic['amplitude_similarity']}
+- mass similarity: {semantic['mass_similarity']}
+
+
+- MUST be resolved into ACCEPT or REJECT based on the pattern similarity
+
+
+Return ONLY:
+Decision: ACCEPT or REJECT
+Confidence: 0-100
+Reason:
+- Describe Accept/Reject Decision
+"""
+    end_prompts = time.time()
+    global total_prompt
+    total_prompt += (end_prompts - start_prompts)
+    return prompt
+
+
+# Which scoring method create_auth_prompt() below dispatches to - flip this
+# to "rule_based" to switch the whole run over to the discrete-label scoring
+# above instead of the continuous 0-100 scoring, with no other code changes
+# needed (both are also included in build_run_signature() so a checkpoint
+# from one scoring method is never silently resumed under the other).
+SCORING_METHOD = "score_based"  # "score_based" or "rule_based"
+
+
+def create_auth_prompt(enroll_feat, attempt_feat, cosine_sim, threshold, baseline):
+    if SCORING_METHOD == "score_based":
+        return create_auth_prompt_score_based(enroll_feat, attempt_feat, cosine_sim, threshold, baseline)
+    elif SCORING_METHOD == "rule_based":
+        return create_auth_prompt_rule_based(enroll_feat, attempt_feat, cosine_sim, threshold, baseline)
+    else:
+        raise ValueError(f"Unknown SCORING_METHOD: {SCORING_METHOD!r} (expected 'score_based' or 'rule_based')")
 
 
 def parse_llm_response(text):
@@ -670,14 +936,15 @@ FAST_PATH_CHECKPOINT_INTERVAL = 50
 def build_run_signature(num_users, sessions_per_user, k, q, n_features, n_embeddings):
     """
     Fingerprints the run configuration a checkpoint was produced under.
-    Resuming against a different dataset size or different num_users/k/q
-    (or a different feature-set script version) would silently splice
-    incompatible rows into the same results file, so this is checked
-    before any checkpoint is trusted.
+    Resuming against a different dataset size, different num_users/k/q, a
+    different feature-set script version, or a different SCORING_METHOD
+    would silently splice incompatible rows into the same results file, so
+    this is checked before any checkpoint is trusted.
     """
     return {
         "feature_version": "v4_cosine_plus_6features",
         "feature_source": FEATURE_FILE_SUFFIX or "default",
+        "scoring_method": SCORING_METHOD,
         "num_users": num_users,
         "sessions_per_user": sessions_per_user,
         "k": k,
