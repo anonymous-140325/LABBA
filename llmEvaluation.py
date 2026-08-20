@@ -654,8 +654,7 @@ Reason: Describe Accept/Reject Decision
 # 0-100 scoring above. Instead of per-user z-scores/DTW-vs-baseline, each
 # feature is thresholded against a fixed, global percentage-difference cutoff
 # into one of five labels (VERY_GOOD/GOOD/OKAY/WEAK/BAD). No per-user
-# baseline is needed here - this scoring system doesn't have one. Ported
-# from newPrompt_6features.py (via newPrompt_6features_demo.py).
+# baseline is needed here - this scoring system doesn't have one.
 # =========================================================
 
 def percentage_difference(a, b):
@@ -874,12 +873,18 @@ Reason:
     return prompt
 
 
-# Which scoring method create_auth_prompt() below dispatches to - flip this
-# to "rule_based" to switch the whole run over to the discrete-label scoring
-# above instead of the continuous 0-100 scoring, with no other code changes
-# needed (both are also included in build_run_signature() so a checkpoint
-# from one scoring method is never silently resumed under the other).
-SCORING_METHOD = "score_based"  # "score_based" or "rule_based"
+# Which scoring method the pipeline below uses - flip this to switch the
+# whole run over, with no other code changes needed (this is also folded
+# into build_run_signature() so a checkpoint from one scoring method is
+# never silently resumed under another):
+#   - "score_based" - continuous 0-100 scores -> create_auth_prompt_score_based()
+#   - "rule_based"  - discrete VERY_GOOD..BAD labels -> create_auth_prompt_rule_based()
+#   - "no_llm"      - no LLM call at all, on any pair, borderline included:
+#                     pure cosine-vs-threshold,
+#                     a baseline to compare the two LLM-assisted methods
+#                     above against. Handled directly in the __main__ loop's
+#                     is_llm_pair gating below, not through create_auth_prompt().
+SCORING_METHOD = "score_based"  # "score_based", "rule_based", or "no_llm"
 
 
 def create_auth_prompt(enroll_feat, attempt_feat, cosine_sim, threshold, baseline):
@@ -887,8 +892,21 @@ def create_auth_prompt(enroll_feat, attempt_feat, cosine_sim, threshold, baselin
         return create_auth_prompt_score_based(enroll_feat, attempt_feat, cosine_sim, threshold, baseline)
     elif SCORING_METHOD == "rule_based":
         return create_auth_prompt_rule_based(enroll_feat, attempt_feat, cosine_sim, threshold, baseline)
+    elif SCORING_METHOD == "no_llm":
+        # Should be unreachable: in "no_llm" mode the __main__ loop's
+        # is_llm_pair is always False, so this branch is never called.
+        # Getting here means that gating broke - fail loudly rather than
+        # silently spend an LLM call "no_llm" was supposed to avoid.
+        raise RuntimeError(
+            "create_auth_prompt() was called while SCORING_METHOD == 'no_llm' - "
+            "check the is_llm_pair gating in __main__, which should skip this "
+            "entirely for every pair in that mode."
+        )
     else:
-        raise ValueError(f"Unknown SCORING_METHOD: {SCORING_METHOD!r} (expected 'score_based' or 'rule_based')")
+        raise ValueError(
+            f"Unknown SCORING_METHOD: {SCORING_METHOD!r} "
+            "(expected 'score_based', 'rule_based', or 'no_llm')"
+        )
 
 
 def parse_llm_response(text):
@@ -913,12 +931,12 @@ def parse_llm_response(text):
 # Checkpointing
 # =========================================================
 
-CHECKPOINT_FILE = "checkpoint_v4.json"
-RESULTS_FILE = "results_v4.csv"
+CHECKPOINT_FILE = "checkpoint.json"
+RESULTS_FILE = "results.csv"
 # Snapshot written only once a run fully finishes. RESULTS_FILE is truncated
 # every time a fresh run starts (see csv_mode == "w" below), so this is the
 # only place the results of the *last completed* run survive a later re-run.
-RESULTS_FINAL_FILE = "results_v4_final.csv"
+RESULTS_FINAL_FILE = "results_final.csv"
 RESULTS_HEADER = [
     "pair", "user_i", "user_j", "cosine",
     "decision", "confidence", "result", "reason",
@@ -942,7 +960,7 @@ def build_run_signature(num_users, sessions_per_user, k, q, n_features, n_embedd
     this is checked before any checkpoint is trusted.
     """
     return {
-        "feature_version": "v4_cosine_plus_6features",
+        "feature_version": "cosine_plus_6features",
         "feature_source": FEATURE_FILE_SUFFIX or "default",
         "scoring_method": SCORING_METHOD,
         "num_users": num_users,
@@ -1113,16 +1131,26 @@ if __name__ == "__main__":
                 else:
                     score_status = "BELOW_THRESHOLD"
 
-                is_llm_pair = score_status == "BORDERLINE"
+                # score_status keeps classifying every pair the same way
+                # regardless of SCORING_METHOD (so it's still visible per-row
+                # for analysis), but "no_llm" mode never actually calls the
+                # LLM for BORDERLINE pairs - they fall through to the same
+                # cosine-vs-threshold REJECT as BELOW_THRESHOLD instead.
+                is_llm_pair = score_status == "BORDERLINE" and SCORING_METHOD != "no_llm"
 
                 if score_status == "ABOVE_THRESHOLD":
                     decision = "ACCEPT"
                     confidence = "100"
                     reason = "Cosine similarity is above the threshold."
-                elif score_status == "BELOW_THRESHOLD":
+                elif score_status == "BELOW_THRESHOLD" or not is_llm_pair:
                     decision = "REJECT"
                     confidence = "100"
-                    reason = "Cosine similarity is below the threshold."
+                    reason = (
+                        "Cosine similarity is below the threshold."
+                        if score_status == "BELOW_THRESHOLD" else
+                        "SCORING_METHOD='no_llm': borderline pair decided by "
+                        "cosine-vs-threshold only, no LLM call."
+                    )
 
                 else:
                     print(f"Comparing sessions {session1}  and {session2} ")

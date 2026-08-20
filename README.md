@@ -17,22 +17,30 @@ is only consulted for borderline decisions.
 3. **Per-user adaptive threshold** — for each enrolled user, a
    cosine-similarity threshold is derived from that user's own session-to-session
    variability (`determine_threshold`, `get_all_user_thresholds`).
-4. **Score enroll vs. attempt** — for each pair, one of two interchangeable
-   scoring methods converts the enroll/attempt features into what the LLM
-   sees, selected via the `SCORING_METHOD` constant near `create_auth_prompt()`:
-   - `"score_based"` (default) — continuous 0-100 similarity scores,
-     each normalized against that user's own per-session baseline
-     (z-score for scalars, DTW-distance-vs-baseline for sequences).
-   - `"rule_based"` — discrete `VERY_GOOD`/`GOOD`/`OKAY`/`WEAK`/`BAD`
-     labels from fixed, global percentage-difference cutoffs — no
-     per-user baseline involved.
+4. **Score enroll vs. attempt (`BORDERLINE` pairs only)** — for each pair
+   whose cosine similarity falls in the borderline band, one of three
+   interchangeable methods decides ACCEPT/REJECT, selected via the
+   `SCORING_METHOD` constant near `create_auth_prompt()`:
+   - `"score_based"` (default) — an LLM call, fed continuous 0-100
+     similarity scores each normalized against that user's own
+     per-session baseline (z-score for scalars, DTW-distance-vs-baseline
+     for sequences).
+   - `"rule_based"` — an LLM call, fed discrete
+     `VERY_GOOD`/`GOOD`/`OKAY`/`WEAK`/`BAD` labels from fixed, global
+     percentage-difference cutoffs — no per-user baseline involved.
+   - `"no_llm"` — no LLM call at all, on any pair, ever: a `BORDERLINE`
+     pair (cosine similarity is always `< threshold` by definition) is
+     decided by cosine-vs-threshold alone, the same way `BELOW_THRESHOLD`
+     pairs already are. A no-LLM baseline to compare the two methods
+     above against.
 
-   Both read the same `fused_features()` output and produce the same
-   `Decision`/`Confidence`/`Reason` prompt contract, so switching between
-   them only requires changing `SCORING_METHOD` — nothing else in the
-   pipeline changes. `SCORING_METHOD` is folded into the checkpoint's run
-   signature, so a checkpoint from one scoring method is never silently
-   resumed under the other.
+   The two LLM-backed methods read the same `fused_features()` output
+   and produce the same `Decision`/`Confidence`/`Reason` prompt contract,
+   so switching between all three only requires changing
+   `SCORING_METHOD` — nothing else in the pipeline changes.
+   `SCORING_METHOD` is folded into the checkpoint's run signature, so a
+   checkpoint from one scoring method is never silently resumed under
+   another.
 5. **Evaluation** — the script sweeps every session pair, tallies
    TP/FP/TN/FN, prints precision/recall/FPR/FNR/accuracy, and writes a
    per-pair breakdown to `results.csv`.
@@ -147,7 +155,7 @@ Key knobs:
 
 | Variable | Meaning |
 |---|---|
-| `SCORING_METHOD` (module-level, just above `create_auth_prompt()`) | `"score_based"` (default) or `"rule_based"` — see [How it works](#how-it-works) above. |
+| `SCORING_METHOD` (module-level, just above `create_auth_prompt()`) | `"score_based"` (default), `"rule_based"`, or `"no_llm"` — see [How it works](#how-it-works) above. |
 | `num_users`, `sessions_per_user` (in `__main__`) | Used to synthesize `session_names` (`user1`, `user1`, ..., `user2`, ...) — must match your dataset's layout and sort order. |
 | `k`, `q` (in `__main__`) | Neighbor/percentile parameters for the per-user threshold (`determine_threshold`). |
 | `range(0, 500)` (x2) in the comparison loop | Number of sessions compared; set to `len(all_embeddings)` for your dataset. |
